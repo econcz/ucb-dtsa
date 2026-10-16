@@ -1,0 +1,580 @@
+---
+title: "NYPD Shooting Incident Data (Historic)"
+author: "Report"
+date: "2026-10-13"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+header-includes:
+  - \usepackage{float}
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include = FALSE}
+if(!file.exists("DATA")){dir.create("DATA")}
+
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(lubridate)
+
+number_fmt  <- function(x) format(x, big.mark = ",") # ancillary function
+pretty_date <- function(x) {                         # ancillary function
+  month_names <- c(
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+  )
+  paste0(
+    month_names[lubridate::month(x)],
+    " ",
+    lubridate::day(x),
+    ", ",
+    lubridate::year(x)
+  )
+}
+```
+
+## Introduction
+
+Shootings occur in every major municipality in the world, which makes the City
+of New York no exception. Across the five boroughs and their numerous precincts,
+NYPD officers react to and produce meticulous notes on each case. This brief
+report will, therefore, present the main findings from the historical NYPD
+Shooting Incident Data set, with the newest version published by the City of
+New York on NYC OpenData [1], which includes every shooting incident recorded by
+the NYPD since 2006. The text answers three research questions: (1) what are the
+long-term trends of shooting incidents for the City as a whole and for each
+borough (with observations aggregated to monthly frequency to employ time-series
+models), (2) are shootings distributed uniformly across boroughs and precincts,
+and (3) which geographical or victim characteristics contribute to a fatal
+outcome (i.e., the incident being declared a murder). Each research question is
+complemented with a formal statistical hypothesis (or a statistical model)
+tested at the standard 5% significance level ($\alpha=0.05$):
+
+- **H1**. Monthly reported incidents have a statistically significant linear
+  trend, i.e., $\beta_1 \neq 0$ in $y_t = \beta_0 + \beta_1 t$.
+
+- **H2**. Within each borough, incidents are distributed uniformly under a
+  Pearson's $\chi^2$ goodness-of-fit test.
+
+- **H3**. The possibility of an incident being classified as a murder depends on
+  precinct, victim age group, sex, and/or race, based on a logistic
+  regression model $\log(\frac{p_i}{1-p_i}) = \beta_0 + \sum_i \beta_i x_i$, in
+  which $\exists_{\beta_i}\ \beta_i \neq 0$.
+
+To compile this report, R packages `tidyverse` and `lubridate` were employed for
+data processing, alongside `ggplot2` for visualization and the `chisq.test()`,
+`lm()` and `glm()` functions for statistical modeling. All R code is embedded
+into the R Markdown document to ensure its reproducibility. The original CSV
+dataset, downloaded from Coursera, is accessed at
+`./DATA/NYPD_Shooting_Incident_Data__Historic_.csv`. The report is subdivided
+into five parts: data description and processing, time trend analysis, spatial
+structure analysis, (logistic) incident classification model, and discussion of
+potential data- and method-related bias.
+
+## Data Description and Processing
+
+```{r hidden1, include = FALSE}
+RAW         <- read_csv('./DATA/NYPD_Shooting_Incident_Data__Historic_.csv')
+n_rows      <- nrow(RAW)
+n_cols      <- ncol(RAW)
+n_na        <- sum(is.na(RAW))
+n_incidents <- n_distinct(RAW$INCIDENT_KEY,      na.rm = TRUE)
+date        <- as.Date(RAW$OCCUR_DATE,          format =  "%m/%d/%Y")
+datetime    <- lubridate::mdy_hms(
+               paste(RAW$OCCUR_DATE, RAW$OCCUR_TIME),
+               tz = "America/New_York"
+)
+t_min       <- format(min(datetime,              na.rm = TRUE),
+                                                "%B %d, %Y at %H:%M")
+t_max       <- format(max(datetime,              na.rm = TRUE),
+                                                "%B %d, %Y at %H:%M")
+boroughs    <- names(sort(table(RAW$BORO),  decreasing = TRUE))
+murders     <- mean(RAW$STATISTICAL_MURDER_FLAG, na.rm = TRUE)
+vic_male    <- mean(RAW$VIC_SEX == "M",          na.rm = TRUE)
+```
+
+The raw (unprocessed) NYPD Shooting Incident dataset consists of
+`r number_fmt(n_rows)` rows and `r n_cols` columns, corresponding to
+`r number_fmt(n_incidents)` unique incidents (one row per victim) recorded
+between `r t_min` and `r t_max`. The data cover `r length(boroughs)` boroughs
+(`r paste(boroughs, collapse = ", ")`). Only about `r round(murders * 100, 1)`%
+of the records were classified as murders with predominantly
+`r if (vic_male > 0.5) "male" else "female or other"` victims
+(`r round(100 * max(vic_male, 1 - vic_male), 1)`%). Given that the data
+comprises `r number_fmt(n_na)` missing values, excessively detailed temporal
+information (dates and times) for the intended monthly time-series analysis,
+additional columns, which will not be used in the analysis, column types
+requiring conversion (e.g., character instead of factor), abbreviated variable
+names (e.g., BORO instead of BOROUGH), and minor value inconsistencies (e.g.,
+"1022" must be recoded `NA` for the VIC_AGE_GROUP), the raw dataset required
+several preprocessing steps: employing `tidyverse`'s `select()`, `mutate()`,
+`rename()`, `group_by()`, and `summarize()` functions to obtain a modified
+tibble `NYPD`.
+
+```{r tidy, echo = TRUE, results = 'hide', message = FALSE}
+NYPD <- read_csv('./DATA/NYPD_Shooting_Incident_Data__Historic_.csv')        %>%
+        select(c(OCCUR_DATE, BORO, PRECINCT, STATISTICAL_MURDER_FLAG,
+                 VIC_AGE_GROUP, VIC_SEX, VIC_RACE))                          %>%
+        mutate(  VIC_AGE_GROUP = na_if(VIC_AGE_GROUP, "1022"),
+                 across(where(is.character), ~na_if(.x, "UNKNOWN")),
+                 across(where(is.character), ~na_if(.x, "(null)")),
+                 OCCUR_DATE              = mdy(OCCUR_DATE), BORO = factor(BORO),
+                 MONTH                   = floor_date(OCCUR_DATE, "month"),
+                 BORO                    = factor(str_to_title(BORO)),
+                 PRECINCT                = factor(PRECINCT),
+                 STATISTICAL_MURDER_FLAG = factor(STATISTICAL_MURDER_FLAG),
+                 VIC_AGE_GROUP           = factor(VIC_AGE_GROUP),
+                 VIC_SEX                 = factor(VIC_SEX),
+                 VIC_RACE                = factor(str_to_title(VIC_RACE)),
+                 SHOOTINGS               = 1)                                %>%
+        group_by(MONTH, BORO, PRECINCT, STATISTICAL_MURDER_FLAG,
+                                        VIC_AGE_GROUP, VIC_SEX, VIC_RACE)    %>%
+                 summarize(SHOOTINGS     = sum(SHOOTINGS,  na.rm = TRUE))    %>%
+        ungroup()                                                            %>%
+        rename(  BOROUGH                 = BORO)                             %>%
+        rename(  MURDER                  = STATISTICAL_MURDER_FLAG)          %>%
+        rename(  VICTIM_AGE_GROUP        = VIC_AGE_GROUP)                    %>%
+        rename(  VICTIM_SEX              = VIC_SEX)                          %>%
+        rename(  VICTIM_RACE             = VIC_RACE)
+```
+
+```{r hidden2, include = FALSE}
+n_rows        <- nrow(NYPD)
+n_cols        <- ncol(NYPD)
+n_na_tidy     <- sum( is.na(NYPD))
+m_min         <- format(min(NYPD$MONTH, na.rm = TRUE), "%B %Y")
+m_max         <- format(max(NYPD$MONTH, na.rm = TRUE), "%B %Y")
+murders       <- NYPD                                                        %>%
+                 filter(!is.na(MURDER))                                      %>%
+                 summarize(
+                      PERCENT = sum(SHOOTINGS[MURDER == "TRUE"])               / 
+                                sum(SHOOTINGS)
+                 )                                                           %>%
+                 pull(PERCENT)
+max_age_group <- NYPD                                                        %>%
+                 filter(NYPD$MURDER == "TRUE")                               %>%
+                 group_by(VICTIM_AGE_GROUP)                                  %>%
+                       summarize(SHOOTINGS = sum(SHOOTINGS, na.rm = TRUE))   %>%
+                 ungroup()                                                   %>%
+                 arrange(desc(   SHOOTINGS))                                 %>%
+                 slice_max(      SHOOTINGS,  n = 1,     with_ties = FALSE)   %>%
+                 pull(    VICTIM_AGE_GROUP)
+
+max_sex       <- NYPD                                                        %>%
+                 filter(NYPD$MURDER == "TRUE")                               %>%
+                 group_by(VICTIM_SEX)                                        %>%
+                       summarize(SHOOTINGS = sum(SHOOTINGS, na.rm = TRUE))   %>%
+                 ungroup()                                                   %>%
+                 arrange(desc(   SHOOTINGS))                                 %>%
+                 slice_max(      SHOOTINGS,  n = 1,     with_ties = FALSE)   %>%
+                 pull(VICTIM_SEX)
+
+max_race      <- NYPD                                                        %>%
+                 filter(NYPD$MURDER == "TRUE")                               %>%
+                 group_by(VICTIM_RACE)                                       %>%
+                       summarize(SHOOTINGS = sum(SHOOTINGS, na.rm = TRUE))   %>%
+                 ungroup()                                                   %>%
+                 arrange(desc(SHOOTINGS))                                    %>%
+                 slice_max(SHOOTINGS,  n=1,      with_ties = FALSE)          %>%
+                 pull(VICTIM_RACE)
+```
+
+The obtained tibble consists of `r number_fmt(n_rows)` rows and `r n_cols`
+columns, where `MONTH` and `SHOOTINGS` were additionally created, with
+`r number_fmt(n_na_tidy)` missing values (i.e., a
+`r round(100 * (1 - n_na_tidy / n_na), 1)`% reduction in the number of missing
+cells), corrected value labels, and readable variable names. To summarize the
+tibble `NYPD`, between `r m_min` and `r m_max`,
+**`r number_fmt(sum(NYPD$SHOOTINGS))` cases** were reported, out of
+which `r number_fmt(sum((NYPD %>% filter(BOROUGH=="Brooklyn"     ))$SHOOTINGS))`
+in Brooklyn,
+      `r number_fmt(sum((NYPD %>% filter(BOROUGH=="Bronx"        ))$SHOOTINGS))`
+in the Bronx,
+      `r number_fmt(sum((NYPD %>% filter(BOROUGH=="Manhattan"    ))$SHOOTINGS))`
+in Manhattan,
+      `r number_fmt(sum((NYPD %>% filter(BOROUGH=="Queens"       ))$SHOOTINGS))`
+in Queens, and
+      `r number_fmt(sum((NYPD %>% filter(BOROUGH=="Staten Island"))$SHOOTINGS))`
+in Staten Island.
+**`r number_fmt(sum(NYPD$SHOOTINGS[NYPD$MURDER=="TRUE"], na.rm = TRUE))`** were
+identified as murders (**`r round(murders * 100, 1)`%**), with the most victims
+in the **`r max_age_group`**
+**age group**, **`r if (max_sex == "M") "male" else "female or other"`**, and
+**`r if (max_race == "Black") "African Americans" else str_to_lower(max_race)`**
+in terms of race. The `summary()` output is below.
+
+```{r summary, echo = TRUE}
+summary(NYPD)
+```
+
+## Analysis of Time Trends
+
+Aggregated monthly data show an uneven distribution of shooting incidents over
+time and across boroughs with a declining linear trend, where the steepest
+decline was observed in Brooklyn (see Table 1). Considering the spatial
+distribution of New York City's population, the Bronx (No. 4 by population)
+accounted for the second largest number of reported incidents (i.e., a higher
+rate per 1000 inhabitants), while Manhattan and Queens (No. 2 and 3) registered
+substantially fewer cases. Figure 1 also reveals periods of high and low shooting
+activity, including a citywide spike during the COVID-19 pandemic. This
+substantial increase may have been associated with socio-economic factors, such
+as social isolation during the government-imposed lockdowns, declining incomes,
+job losses, etc. -- i.e., potential relationships that require further
+investigation.
+
+```{r figure1, echo = TRUE, message = FALSE, fig.height = 3.8, fig.pos = "H"}
+ggplot(NYPD                                                                  %>%
+       group_by( MONTH, BOROUGH)                                             %>%
+                summarize(SHOOTINGS  = sum(SHOOTINGS, na.rm = TRUE))         %>%
+       ungroup()                                                             %>%
+       bind_rows(NYPD                                                        %>%
+                 group_by(MONTH)                                             %>%
+                summarize(SHOOTINGS  = sum(SHOOTINGS, na.rm = TRUE),
+                .groups          = "drop")                                  %>%
+                 mutate(BOROUGH  = "Total")
+       ),       aes(x = MONTH, y = SHOOTINGS, group     = BOROUGH))            +
+  geom_line(linewidth = 0.7) +
+  geom_smooth(method = "lm", formula = y ~ x, linewidth = 0.5, color = "red")  +
+  facet_wrap(~BOROUGH, axes = "all_x", axis.labels = "all_x")                  +
+  scale_y_continuous(labels = scales::comma)                                   +
+  labs(
+    title = paste0("Figure 1. Reported shooting incidents, ",
+                   as.character(m_min), "-", as.character(m_max)),
+    x = "Month",
+    y = "Reported shooting incidents"
+  )                                                                            +
+  theme_minimal()
+```
+
+The formal statistical test of **H1** is tied to coefficients $\beta_1$ from six
+linear regression models `lm(SHOOTINGS ~ MONTH SEQUENCE)`, i.e., for each
+borough and the dataset as a whole, with the `MONTH` encoded with the help of
+`seq_along()` into a time-series sequence. Table 1 comprises the slopes, their
+standard errors, the two-sided p-values, and the $R^2$ (coefficient of
+determination) of the fit. Apart from Manhattan, the remaining coefficients
+are non-zero at the 5% significance level ($\alpha=0.05$), although the models
+reveal weak explanatory power -- i.e., potential additional factors influencing
+the number of shooting incidents, such as a unit root.
+
+```{r table1, echo = TRUE}
+NYPD                                                                         %>%
+group_by( MONTH, BOROUGH)                                                    %>%
+         summarize(SHOOTINGS = sum(SHOOTINGS), .groups = "drop")             %>%
+bind_rows(NYPD                                                               %>%
+          group_by(MONTH) %>%
+         summarize(SHOOTINGS = sum(SHOOTINGS), .groups = "drop")             %>%
+          mutate(BOROUGH                               = "Total")
+)                                                                            %>%
+  filter(!is.na(BOROUGH),   !is.na(MONTH))                                   %>%
+ arrange(BOROUGH, MONTH) %>%
+group_by(BOROUGH) %>%
+         summarize(MODEL = list(summary(lm(SHOOTINGS ~ seq_along(MONTH)))))  %>%
+transmute(
+         Borough = BOROUGH,
+         Slope   = sapply(MODEL, \(m) m$coefficients[2, 1]),
+         SE      = sapply(MODEL, \(m) m$coefficients[2, 2]),
+         P       = sapply(MODEL, \(m) m$coefficients[2, 4]),
+         R2      = sapply(MODEL, \(m) m$r.squared)
+)                                                                            %>%
+knitr::kable(digits  = 3,
+             caption = "Linear trends in reported shooting incidents")
+```
+
+## Analysis of Spatial Structure
+
+``` {r hidden3, include = FALSE}
+precincts     <- NYPD                                                        %>%
+                 group_by(BOROUGH, PRECINCT)                                 %>%
+                       summarize(SHOOTINGS = sum(SHOOTINGS, na.rm = TRUE),
+                                 .groups   = "drop")                         %>%
+                 group_by(BOROUGH)                                           %>%
+                       slice_max(order_by  = SHOOTINGS,         n = 10,
+                                 with_ties = FALSE)                          %>%
+                 ungroup()
+```
+
+Figure 2 demonstrates the distribution of shooting incidents by precinct.
+Namely, the three precincts with the most reported incidents are **No.**
+**`r (precincts                                                              %>%
+slice_max(order_by = SHOOTINGS, n = 3, with_ties = FALSE))$PRECINCT          %>%
+paste(collapse = ", ")`** citywide,    **No.**
+**`r (precincts %>% filter(BOROUGH == "Bronx")                               %>%
+slice_max(order_by = SHOOTINGS, n = 3, with_ties = FALSE))$PRECINCT          %>%
+paste(collapse = ", ")`** in the Bronx, (the above-mentioned)    **No.**
+**`r (precincts %>% filter(BOROUGH == "Brooklyn")                            %>%
+slice_max(order_by = SHOOTINGS, n = 3, with_ties = FALSE))$PRECINCT          %>%
+paste(collapse = ", ")`** in Brooklyn, **No.**
+**`r (precincts %>% filter(BOROUGH == "Manhattan")                           %>%
+slice_max(order_by = SHOOTINGS, n = 3, with_ties = FALSE))$PRECINCT          %>%
+paste(collapse = ", ")`** in Manhattan, **No.**
+**`r (precincts %>% filter(BOROUGH == "Queens")                              %>%
+slice_max(order_by = SHOOTINGS, n = 3, with_ties = FALSE))$PRECINCT          %>%
+paste(collapse = ", ")`** in Queens, and **No.**
+**`r (precincts %>% filter(BOROUGH == "Staten Island")                       %>%
+slice_max(order_by = SHOOTINGS, n = 3, with_ties = FALSE))$PRECINCT          %>%
+paste(collapse = ", ")`** in Staten Island. These findings strongly indicate a
+non-uniform distribution of the examined data.
+
+```{r figure2, echo = TRUE, message = FALSE, fig.height = 3.8, fig.pos = "H"}
+ggplot(NYPD                                                                  %>%
+       group_by( BOROUGH, PRECINCT)                                          %>%
+                summarize(SHOOTINGS  = sum(SHOOTINGS,       na.rm = TRUE))   %>%
+       ungroup()                                                             %>%
+       bind_rows(NYPD                                                        %>%
+                 group_by(PRECINCT)                                          %>%
+                summarize(SHOOTINGS  = sum(SHOOTINGS,       na.rm = TRUE),
+                .groups         = "drop")                                    %>%
+                 mutate(BOROUGH = "Total")
+       )                                                                     %>%
+       group_by( BOROUGH)                                                    %>%
+                slice_max(order_by = SHOOTINGS, n = 10, with_ties = FALSE)   %>%
+       ungroup(),    aes(x = reorder(PRECINCT, SHOOTINGS), y = SHOOTINGS))     +
+  geom_col(width = 0.7)                                                        +
+  coord_flip()                                                                 +
+  facet_wrap(~ BOROUGH, scales  = "free_y", axes        = "all_x",
+                                            axis.labels = "all_x")             +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = paste0("Figure 2. Top ten precincts by incidents, ",
+                   as.character(m_min), "-", as.character(m_max)),
+    x = "Precinct",
+    y = "Reported shooting incidents"
+  )                                                                            +
+  theme_minimal()
+```
+
+The formal statistical test of **H2** is based on Pearson's chi-square
+goodness-of-fit test `chisq.test(SHOOTINGS)` applied to six distributions of
+reported shooting incidents across precincts, i.e., for each borough and the
+dataset as a whole, with the null hypothesis assuming a uniform distribution of
+incidents ($H_0: p_1 = p_2 = \cdots = p_k = 1/k$), where $k$ is the number of
+precincts, and a p-value precision of $0.001$. The resulting Table 2 comprises
+the $\chi^2$ statistics, degrees of freedom, and upper-tail p-values. $H_0$ is
+rejected in all cases at the 5% significance level ($\alpha=0.05$), confirming a
+statistically significant non-uniform distribution of shooting incidents across
+precincts, which may reflect variations in population density, socio-economic
+conditions, etc. -- i.e., potential relationships meriting further investigation
+with the help of statistical (quantitative) modeling.
+
+```{r table2, echo = TRUE}
+NYPD                                                                         %>%
+group_by( BOROUGH, PRECINCT)                                                 %>%
+         summarize(SHOOTINGS = sum(SHOOTINGS), .groups = "drop")             %>%
+bind_rows(NYPD                                                               %>%
+          group_by(PRECINCT)                                                 %>%
+         summarize(SHOOTINGS = sum(SHOOTINGS), .groups = "drop")             %>%
+          mutate(BOROUGH                               = "Total")
+)                                                                            %>%
+  filter(!is.na(BOROUGH),   !is.na(PRECINCT))                                %>%
+group_by( BOROUGH)                                                           %>%
+         summarize(TEST = list(chisq.test(SHOOTINGS)))                       %>%
+transmute(
+         Borough = BOROUGH,
+         Chi2    = sapply(TEST, \(m) unname(m$statistic)),
+         DF      = sapply(TEST, \(m) unname(m$parameter)),
+         P       = sapply(TEST, \(m) m$p.value)
+)                                                                            %>%
+mutate(P = scales::pvalue(P, accuracy = 0.001))                              %>%
+knitr::kable(digits  = 3,
+             caption = "Pearson chi-square tests of uniform distribution")
+```
+
+## Incident Classification Model
+
+In order to identify the probability and corresponding odds of a shooting
+incident being classified as a murder, -- which may provide valuable insights
+for police precincts in allocating resources between calls, anticipating risks,
+or developing potential preventive measures -- the following logistic regression
+(a generalized linear model of the binomial family with a logit link) is
+employed, with the log-odds modeled as a function of `PRECINCT` (`P`),
+`VICTIM_AGE_GROUP` (`A`), `VICTIM_SEX` (`S`), and `VICTIM_RACE` (`R`). Its
+predictors (features) were selected to reflect geography -- given the
+above-established non-uniformity of distribution of shooting incidents across
+precincts -- and demographics, specifically victim characteristics, given
+the limited availability of information (a higher proportion of missing values)
+on other potentially relevant predictors in the original (raw) dataset.
+
+$$
+\log\left(\frac{P(\text{MURDER}=1)}{1-P(\text{MURDER}=1)}\right)
+= \beta_0
++ \sum_{j=1}^{J_P}\beta_{P_j}P_j
++ \sum_{j=1}^{J_A}\beta_{A_j}A_j
++ \sum_{j=1}^{J_S}\beta_{S_j}S_j
++ \sum_{j=1}^{J_R}\beta_{R_j}R_j
+$$
+
+The results of the `glm()` function estimated on the tibble `NYPD`, aggregated
+across `BOROUGH` and `MONTH` with `SHOOTINGS` set as frequency weights, are
+presented in Tables 3 and 4, and the corresponding R code below.
+
+```{r model, echo = TRUE, results = 'hide'}
+model <- glm(
+  MURDER ~        PRECINCT + VICTIM_AGE_GROUP + VICTIM_SEX + VICTIM_RACE,
+  data = NYPD                                                                %>%
+         group_by(PRECINCT,  MURDER,
+                             VICTIM_AGE_GROUP,  VICTIM_SEX,  VICTIM_RACE)    %>%
+                  summarise(SHOOTINGS = sum(SHOOTINGS), .groups = "drop"),
+  weights = SHOOTINGS,
+  family = binomial()
+)
+```
+
+Following the model, the formal statistical test of **H3** is
+$H_0: \forall_{\beta_{x_j}}\ \beta_{x_j} = 0$ against
+$H_1: \exists_{\beta_{x_j}}\ \beta_{x_j} \neq 0$, where
+$x_j \in \{P_j, A_j, S_j, R_j\}$. Table 3 comprises the statistically
+significant coefficients $\beta_{x_j}$ (log-odds) and equivalent odds ratios
+$exp(\beta_{x_j})$  at the 5% significance level ($\alpha=0.05$) (i.e., the
+table is truncated given the number of precincts in the dataset), their
+standard errors, and the two-sided p-values. Individual $\beta_{x_j}$ indicate
+significant odds differences across police precincts and victim age groups. On
+the one hand, relative to Precinct 1 (the reference category), 28 precincts
+have significantly lower odds of a murder incident, with odds ratios ranging
+from 0.164 (Precinct 7) to 0.448 (Precinct 73) and standard errors being
+near-identical ($\approx 0.40-0.60$). On the other hand, victim age group
+shows a clear increasing pattern: relative to victims under 18 (the reference
+category), the odds of a murder incident are ca. 29%, 81%, 111%, and
+169% higher for ages 18–24, 25–44, 45–64, and 65+ respectively, with
+significantly lower standard errors ($\approx 0.06-0.15$). No level of victim
+sex or race, included in the logistic regression equation, was found to be
+statistically significant at the 5% level.
+
+```{r table3, echo = TRUE}
+as.data.frame(summary(model)$coefficients)                                   %>%
+tibble::rownames_to_column("Predictor")                                      %>%
+filter(`Pr(>|z|)` < 0.05)                                                    %>%
+transmute(
+  Predictor,
+  `Coefficient (log-odds)` = Estimate,
+  `Odds ratio`             = exp(Estimate),
+  `Std. error`             = `Std. Error`,
+  `P`                      = scales::pvalue(`Pr(>|z|)`, accuracy = 0.001)
+)                                                                            %>%
+knitr::kable(
+  digits  = 3,
+  caption = "Statistically significant logistic regression coefficients"
+)
+```
+
+Furthermore, the deviance-based likelihood-ratio (LR) test rejects the null
+hypothesis of joint insignificance of the included predictors
+$\chi^2(87) = 435.603$, with a p-value smaller than $0.001$, providing further
+statistical support for `H_1` (see Table 4). Still, McFadden's
+pseudo-$R^2$ of 0.015 indicates only a ca. 1.5% improvement in log-likelihood
+relative to the intercept-only model, suggesting limited explanatory power and
+reducing the practical significance of the findings. Thus, additional features
+should be considered in further investigation.
+
+```{r table4, echo = TRUE}
+tibble(
+  Statistic = c(
+    "Observations", "Null deviance", "Residual deviance", "LR chi-square",
+    "LR degrees of freedom", "LR p-value", "AIC", "McFadden pseudo-R²"
+  ),
+  Value = c(
+    sum(weights(model, type = "prior")),
+    round(model$null.deviance, 3), round(model$deviance, 3),
+    round(model$null.deviance - model$deviance,          3),
+    model$df.null -  model$df.residual, scales::pvalue(
+      pchisq(model$null.deviance - model$deviance,
+             df = model$df.null  - model$df.residual,    lower.tail = FALSE),
+      accuracy  = 0.001
+    ),                             round(AIC(model),     3),
+    round(1 -     model$deviance / model$null.deviance,  3)
+  )
+)                                                                            %>%
+knitr::kable(
+  digits  = 3,
+  caption = "Logistic regression goodness-of-fit and likelihood-ratio test"
+)
+```
+
+## Discussion of Potential Bias
+
+The findings in the report, despite the use of rigorous methodology, are subject
+to several potential biases, the first group of which is data-related. On the
+one hand, the original (raw) dataset comprises `r number_fmt(n_na)` missing
+cells, to which the recoding of placeholders (e.g., "UNKNOWN", "(null)", and
+"1022") added further `NA` values, namely, in the victim characteristics. Since
+statistical models, including `glm()`, dropped rows with missing values by
+default, the logistic regression was estimated on a smaller subset of victims
+(29,624, see Table 4), which might have introduced selection bias if the missing
+values were not randomly distributed, in addition to the loss of information for
+estimation. On the other hand, aggregation to monthly frequency discarded
+the within-month and hourly variability (`OCCUR_TIME`), while aggregation across
+`BOROUGH` and `MONTH` for the classification model assumed constant odds
+between `r m_min` and `r m_max`. Moreover, the data itself might also have been
+a source of bias due to how it was collected and compiled into the original
+dataset.
+
+The second group of potential biases is method-related, given that the three
+statistical hypotheses were tested with basic (textbook) procedures, and more
+advanced models could be employed. First, the linear trends in Table 1 did not
+account for potential unit roots, seasonality of `SHOOTINGS`, and violations of
+Gauss-Markov assumptions, which might have produced biased or spurious estimates
+-- e.g., a (seasonal) ARIMA could be a more adequate model. Second, given the
+data limitations, the logistic regression included only four predictors (and
+levels thereof) and its McFadden's pseudo-$R^2$ of 0.015 hinted at possible
+omission of relevant predictors, potentially contributing to the bias. Hence,
+although these limitations do not necessarily invalidate the findings, they
+merit further statistical investigation (which is, however, beyond the scope of
+this short report).
+
+## Conclusion
+
+This brief report examined `r number_fmt(sum(NYPD$SHOOTINGS))` shooting
+incidents recorded by the NYPD, which took place between `r m_min` and
+`r m_max` and out of which ca. `r round(murders * 100, 1)`% were classified as
+murders, and answered the three research questions with the help of formal
+statistical hypotheses tested at the 5% significance level ($\alpha=0.05$).
+First, in terms of long-term trends (1), monthly time series exhibited a
+declining linear trend for the City of New York as a whole and for four of the
+five boroughs, with the steepest slope (i.e., decline) in Brooklyn, leading to
+acceptance of **H1** in all cases except Manhattan (see Table 1) -- although the
+low $R^2$ values and a citywide spike in incidents during the COVID-19 pandemic
+(see Figure 1) merit further investigation. Second, in terms of the spatial
+structure (2), shooting incidents were found to be concentrated in a small
+number of precincts, namely, in the Bronx and Brooklyn (see Figure 2), and
+Pearson's $\chi^2$ goodness-of-fit tests rejected the uniform distribution for
+each borough and the dataset as a whole (see Table 2), i.e., leading to 
+rejection of **H2**. Third, in terms of murder classification (3), the logistic
+regression statistically supported **H3**: the odds of a murder incident
+differed significantly across precincts (e.g., 28 precincts exhibited lower odds
+when compared to Precinct 1) and increased with victim age (up to 169% higher
+odds when compared to victims under 18), while victim sex and race were not
+found to be statistically significant (see Table 3), a finding also confirmed
+by an LR test (see Table 4). Still, McFadden's pseudo-$R^2$ of 0.015 suggested
+limited explanatory power of geography and victim demographics. To sum up, in
+light of the potential data-related and method-related biases, the findings of
+the report should be interpreted with caution; hence, the use of more advanced
+time-series models, as well as additional predictors, is recommended.
+
+## References
+
+[1] Police Department (NYPD). 2025. "NYPD Shooting Incident Data (Historic)."
+Dataset. NYC Open Data.
+https://data.cityofnewyork.us/Public-Safety/NYPD-Shooting-Incident-Data-Historic-/833y-fsy8.
+
+R Core Team. 2025a. *R: A Language and Environment for Statistical Computing*.
+Version 4.5.1. Vienna: R Foundation for Statistical Computing.
+https://www.R-project.org/.
+
+R Core Team. 2025b. "chisq.test: Pearson's Chi-Squared Test for Count Data."
+In *R Documentation*, package `stats`, version 4.5.1.
+https://stat.ethz.ch/R-manual/R-patched/library/stats/html/chisq.test.html.
+
+R Core Team. 2025c. "glm: Fitting Generalized Linear Models." In
+*R Documentation*, package `stats`, version 4.5.1.
+https://stat.ethz.ch/R-manual/R-patched/library/stats/html/glm.html.
+
+Wickham, Hadley, Mine Çetinkaya-Rundel, and Garrett Grolemund. 2023. *R for
+Data Science: Import, Tidy, Transform, Visualize, and Model Data*. 2nd ed.
+Sebastopol, CA: O'Reilly Media. https://r4ds.hadley.nz.
+
+## Acknowledgement of AI Use
+
+I acknowledge the use of Grammarly (https://www.grammarly.com) to check the
+spelling, grammar, and punctuation of the final text of this report.

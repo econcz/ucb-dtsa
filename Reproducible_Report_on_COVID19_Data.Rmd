@@ -1,0 +1,615 @@
+---
+title: "Reproducible Report on COVID19 Data"
+author: "Report"
+date: "2026-10-14"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+header-includes:
+  - \usepackage{float}
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include = FALSE}
+if(!file.exists("DATA")){dir.create("DATA")}
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(lubridate)
+library(rconvertu)
+library(forecast)
+
+number_fmt  <- function(x) format(x, big.mark = ",")  # ancillary function
+percent_fmt <- function(x, digits = 2) {              # ancillary function
+  paste0(format(round(100 * x, digits), nsmall = digits), "%")
+}
+```
+
+## Introduction
+
+The COVID-19 pandemic affected every country in the world. To monitor its
+course, between January 2020 and March 2023, the Center for Systems Science and
+Engineering (hereafter abbreviated as CSSE) at Johns Hopkins University
+maintained a dataset compiled from data retrieved from  national health
+authorities, downloadable from a single GitHub repository [1], [2]. This brief
+report presents the main findings from its global time series of cumulative
+confirmed cases and deaths by country and answers three research questions:
+(1) what were the long-term trends of cumulative cases, deaths, and, above all,
+the mortality rate (total deaths to total cases, i.e., the case fatality rate)
+for the world as a whole (aggregated to monthly frequency to employ time-series
+models), (2) were cases, deaths, and the mortality rate distributed uniformly
+across countries, and (3) which (preferably, automatically selected) ARIMA model
+describes the monthly world series and what does it predict for the subsequent
+12 months. Each question is complemented with a formal statistical hypothesis
+(or model for the Auto-ARIMA) tested at the standard 5% significance level
+($\alpha=0.05$):
+
+- **H1**. Monthly cumulative cases, deaths, and the mortality rate have a
+  statistically significant linear trend, i.e., $\beta_1 \neq 0$ in
+  $y_t = \beta_0 + \beta_1 t$, at both world (total of all countries) and
+  individual country level.
+
+- **H2**. Across countries, cases and deaths are distributed uniformly, and
+  the mortality rate is uniform (i.e., deaths are distributed proportionally
+  to cases), under a built-in Pearson's $\chi^2$ goodness-of-fit test.
+
+- **H3**. The monthly world time series are adequately described and afterward
+  predicted (for at least the subsequent 12 months) by an
+  $ARIMA(p,d,q)(P,D,Q)_{12}$ process, selected automatically by the
+  Hyndman-Khandakar algorithm [3], i.e., the model residuals are white noise
+  under the Ljung-Box test.
+
+To compile this report, R packages `tidyverse`, `lubridate`, `rconvertu`
+(the author's package converting between country names and ISO 3166-1 alpha-3,
+alpha-2, and numeric codes using regular expressions), `ggplot2`, and
+`forecast` were employed, with all R code embedded into the R Markdown document
+to ensure its reproducibility. The CSV datasets, downloaded from the CSSE GitHub
+repository, are accessed in the folder `./DATA/` as
+`time_series_covid19_confirmed_global.csv` and
+`time_series_covid19_deaths_global.csv` (the detailed US files are ignored).
+The report is subdivided into five parts: data description and processing,
+time trends, cross-country structure, (ARIMA) time-series model with a
+12-month forecast, and potential bias.
+
+## Data Description and Processing
+
+```{r hidden1, include = FALSE}
+RAW_CASES   <- read_csv('./DATA/time_series_covid19_confirmed_global.csv')
+RAW_DEATHS  <- read_csv('./DATA/time_series_covid19_deaths_global.csv')
+n_rows      <- nrow(RAW_CASES)
+n_cols      <- ncol(RAW_CASES)
+n_na        <- sum(is.na(RAW_CASES)) + sum(is.na(RAW_DEATHS))
+n_countries <- n_distinct(RAW_CASES$`Country/Region`, na.rm = TRUE)
+n_provinces <- sum(!is.na(RAW_CASES$`Province/State`))
+dates       <- mdy(names(RAW_CASES)[-(1:4)])
+t_min       <- format(min(dates, na.rm = TRUE), "%B %d, %Y")
+t_max       <- format(max(dates, na.rm = TRUE), "%B %d, %Y")
+```
+
+The raw (unprocessed) dataset consists of two CSV files (confirmed cumulative
+cases and deaths), each with `r number_fmt(n_rows)` rows and
+`r number_fmt(n_cols)` columns, i.e., `r n_countries` countries and
+`r n_provinces` provinces or territories thereof, with one row per territorial
+unit and one column per day between `r t_min` and `r t_max` (i.e., the dataset
+is in a wide format). Given that the data comprise `r number_fmt(n_na)` missing
+values (all in `Province/State`), daily cumulative counts (which are too
+detailed for the intended time-series analysis), unused columns (`Lat`, `Long`),
+non-ISO 3166-1 country names (e.g., "US", "Korea, South", or "Taiwan*"), and
+minor value inconsistencies (e.g., "Congo (Brazzaville)" and "West Bank and
+Gaza" must be recoded for the ISO 3166-1 conversion), the raw dataset required
+several preprocessing steps -- employing `tidyverse`'s `pivot_longer()`,
+`full_join()`, `select()`, `mutate()`, `group_by()`, `summarize()`, and
+`slice_max()` functions, alongside `rconvertu`'s `convertu()` for ISO 3166-1
+alpha-3 codes (`ISO3`) and English names (`NAME_EN`) -- to obtain a modified
+panel tibble `COVID` in a long format (month-end cumulative values) and the
+world totals `WORLD` (consult the R code field below).
+
+```{r tidy, echo = TRUE, results = 'hide'}
+COVID <- read_csv('./DATA/time_series_covid19_confirmed_global.csv')         %>%
+         pivot_longer(-(1:4), names_to = "DATE", values_to = "CASES")        %>%
+         full_join(
+         read_csv('./DATA/time_series_covid19_deaths_global.csv')            %>%
+         pivot_longer(-(1:4), names_to = "DATE", values_to = "DEATHS")       %>%
+         select(-c(Lat, Long)),
+         by = c("Province/State", "Country/Region", "DATE"))                 %>%
+         select(  COUNTRY   = `Country/Region`, DATE, CASES, DEATHS)         %>%
+         mutate(  COUNTRY   = recode(COUNTRY,
+                              "Congo (Brazzaville)" = "Republic of the Congo",
+                              "West Bank and Gaza"  = "Palestine"),
+                  DATE      = mdy(DATE),
+                  MONTH     = floor_date(DATE, "month"))                     %>%
+         group_by(COUNTRY, MONTH, DATE)                                      %>%
+                  summarize(CASES     = sum(CASES,  na.rm = TRUE),
+                            DEATHS    = sum(DEATHS, na.rm = TRUE),
+                            .groups   = "drop")                              %>%
+         group_by(COUNTRY, MONTH)                                            %>%
+                  slice_max(DATE, n = 1, with_ties = FALSE)                  %>%
+         group_by(COUNTRY)                                                   %>%
+         mutate(  ISO3      = convertu(to = "iso3",    text = first(COUNTRY)),
+                  NAME_EN   = convertu(to = "name_en", text = first(COUNTRY)),
+                  ISO3      = factor(if_else(ISO3 == COUNTRY, NA, ISO3)),
+                  MORTALITY = if_else(CASES > 0, DEATHS / CASES, NA))        %>%
+         ungroup()                                                           %>%
+         filter(  !is.na(ISO3))                                              %>%
+         select(  ISO3, NAME_EN, MONTH, CASES, DEATHS, MORTALITY)            %>%
+         arrange( ISO3, MONTH)
+
+WORLD <- COVID                                                               %>%
+         group_by(MONTH)                                                     %>%
+                  summarize(CASES     = sum(CASES,  na.rm = TRUE),
+                            DEATHS    = sum(DEATHS, na.rm = TRUE),
+                            .groups   = "drop")                              %>%
+         mutate(  MORTALITY = DEATHS / CASES)
+```
+
+```{r hidden2, include = FALSE}
+n_rows        <- nrow(COVID)
+n_cols        <- ncol(COVID)
+n_na_tidy     <- sum( is.na(COVID))
+n_iso3        <- n_distinct(COVID$ISO3)
+m_min         <- format(min(COVID$MONTH, na.rm = TRUE), "%B %Y")
+m_max         <- format(max(COVID$MONTH, na.rm = TRUE), "%B %Y")
+dropped       <- RAW_CASES                                                   %>%
+                 distinct(COUNTRY = `Country/Region`)                        %>%
+                 mutate(ISO3 = convertu(to = "iso3", text = recode(COUNTRY,
+                              "Congo (Brazzaville)" = "Republic of the Congo",
+                              "West Bank and Gaza"  = "Palestine")))         %>%
+                 filter(ISO3 == COUNTRY)                                     %>%
+                 pull(COUNTRY)
+LATEST        <- COVID                                                       %>%
+                 filter(MONTH == max(MONTH))
+total_cases   <- sum(LATEST$CASES,  na.rm = TRUE)
+total_deaths  <- sum(LATEST$DEATHS, na.rm = TRUE)
+mortality     <- total_deaths / total_cases
+top           <- function(x, n = 3, min_cases = 0) {
+  LATEST                                                                     %>%
+  filter(CASES >= min_cases)                                                 %>%
+  slice_max(order_by = {{x}}, n = n, with_ties = FALSE)                      %>%
+  pull(NAME_EN)                                                              %>%
+  paste(collapse = ", ")
+}
+```
+
+The obtained panel tibble `COVID` consists of `r number_fmt(n_rows)` rows
+(`r n_iso3` countries $\times$ `r n_distinct(COVID$MONTH)` months) and
+`r n_cols` columns, with `r number_fmt(n_na_tidy)` missing values
+(`MORTALITY` is undefined without confirmed cases); `r length(dropped)` units
+without an ISO 3166-1 code (`r paste(dropped, collapse = ", ")`) were
+dropped. Between `r m_min` and `r m_max`,
+**`r number_fmt(total_cases)` confirmed cases** and
+**`r number_fmt(total_deaths)` deaths** were reported, i.e., a **mortality
+rate of `r percent_fmt(mortality)`**, with the most cases and deaths in
+**`r top(DEATHS, n = 1)`**, and the highest mortality rate (among countries with
+over 1,000 cases) in **`r top(MORTALITY, n = 1, min_cases = 1000)`**. The
+`summary()` output is below.
+
+```{r summary, echo = TRUE}
+summary(COVID)
+```
+
+## Analysis of Time Trends
+
+```{r hidden3, include = FALSE}
+SLOPES   <- COVID                                                            %>%
+            filter(!is.na(MORTALITY))                                        %>%
+            arrange(ISO3, MONTH)                                             %>%
+            group_by(ISO3)                                                   %>%
+            filter(n() >= 12)                                                %>%
+            summarize(MODEL = list(summary(lm(100 * MORTALITY ~
+                                               seq_along(MONTH)))),
+                      .groups = "drop")                                      %>%
+            transmute(
+              Slope   = sapply(MODEL, \(m) m$coefficients[2, 1]),
+              P       = sapply(MODEL, \(m) m$coefficients[2, 4])
+            )
+n_slopes <- nrow(SLOPES)
+n_neg    <- sum(SLOPES$P < 0.05 & SLOPES$Slope < 0)
+n_pos    <- sum(SLOPES$P < 0.05 & SLOPES$Slope > 0)
+peak     <- WORLD                                                            %>%
+            slice_max(MORTALITY, n = 1, with_ties = FALSE)
+slope_m  <- abs(coef(lm(100 * MORTALITY ~ seq_along(MONTH), WORLD))[2])
+```
+
+Aggregated monthly data show an increasing (cumulative) number
+of cases and deaths worldwide, with the steepest increase in cases during the
+so-called Omicron wave in early 2022 (see Figure 1). The mortality rate, on the
+contrary, peaked at `r percent_fmt(peak$MORTALITY)` in
+`r format(peak$MONTH, "%B %Y")`, when testing was scarce and limited to
+severe cases only, and then declined steadily towards `r percent_fmt(mortality)`
+in `r m_max` due to advances in mitigation (among other, vaccine roll-out), 
+reducing the disease to milder variants. Both cumulative curves also
+flattened in late 2022 and early 2023, when many countries scaled down reporting
+(the CSSE's last dataset update was on March 10, 2023).
+
+```{r figure1, echo = TRUE, fig.height = 3, fig.pos = "H"}
+ggplot(WORLD                                                                 %>%
+       transmute(MONTH, Cases = CASES, Deaths = DEATHS,
+                `Mortality rate (%)` = 100 * MORTALITY)                      %>%
+       pivot_longer(-MONTH, names_to = "SERIES", values_to = "VALUE")        %>%
+       mutate(SERIES = factor(SERIES, levels = c("Cases", "Deaths",
+                                                 "Mortality rate (%)"))),
+       aes(x = MONTH, y = VALUE))                                              +
+  geom_line(linewidth = 0.7)                                                   +
+  geom_smooth(method = "lm", formula = y ~ x, linewidth = 0.5, color = "red")  +
+  facet_wrap(~SERIES, scales = "free_y", axes = "all_x",
+                                         axis.labels = "all_x")                +
+  scale_y_continuous(labels = scales::comma)                                   +
+  labs(
+    title = paste0("Figure 1. Cases, deaths, and mortality rate, ",
+                   format(min(WORLD$MONTH), "%b %Y"), "-",
+                   format(max(WORLD$MONTH), "%b %Y")),
+    x = "Month",
+    y = "Cumulative value (world)"
+  )                                                                            +
+  theme_minimal()
+```
+
+The formal statistical test of **H1** is tied to coefficients $\beta_1$ from
+three linear regression models `lm(VALUE ~ MONTH SEQUENCE)`, i.e., for the
+cumulative cases, deaths, and the mortality rate of the world as a whole,
+with the `MONTH` encoded with the help of `seq_along()` into a time-series
+sequence. Since the CSSE data contain no regional (continental) aggregates,
+the same model was also estimated for the mortality rate of each of the
+`r n_slopes` countries with at least 12 months of data: the slope is
+significantly negative for `r n_neg`, significantly positive for `r n_pos`,
+and insignificant for `r n_slopes - n_neg - n_pos` countries, i.e., the
+declining world trend is shared by a majority
+(`r round(100 * n_neg / n_slopes)`%) of countries. Table 1 comprises the
+slopes, their standard errors, the two-sided p-values, and the $R^2$ of the
+fit: all three coefficients are non-zero at the 5% significance level
+($\alpha=0.05$), with the mortality rate declining on average by
+`r round(slope_m, 3)` percentage points per month. However, the high $R^2$
+values of cumulative series are typical of integrated (non-stationary)
+processes, i.e., potential unit roots to be addressed by an (S)ARIMA model.
+
+```{r table1, echo = TRUE}
+WORLD                                                                        %>%
+transmute(MONTH, Cases = CASES, Deaths = DEATHS,
+          `Mortality rate (%)` = 100 * MORTALITY)                            %>%
+pivot_longer(-MONTH, names_to = "SERIES", values_to = "VALUE")               %>%
+mutate(  SERIES = factor(SERIES, levels = c("Cases", "Deaths",
+                                            "Mortality rate (%)")))          %>%
+ arrange(SERIES, MONTH)                                                      %>%
+group_by(SERIES)                                                             %>%
+         summarize(MODEL = list(summary(lm(VALUE ~ seq_along(MONTH)))))      %>%
+transmute(
+         Series  = SERIES,
+         Slope   = sapply(MODEL, \(m) m$coefficients[2, 1]),
+         SE      = sapply(MODEL, \(m) m$coefficients[2, 2]),
+         P       = sapply(MODEL, \(m) m$coefficients[2, 4]),
+         R2      = sapply(MODEL, \(m) m$r.squared)
+)                                                                            %>%
+mutate(P = scales::pvalue(P, accuracy = 0.001))                              %>%
+knitr::kable(digits  = 3, format.args = list(big.mark = ",",
+                                             scientific = FALSE),
+             caption = "Linear trends in world cases, deaths, and mortality")
+```
+
+## Analysis of Cross-Country Structure
+
+Figure 2 demonstrates the distribution of cases, deaths, and the mortality
+rate by country (labeled with ISO 3166-1 alpha-3 codes) as of `r m_max`.
+Namely, the three countries with the most cases are **`r top(CASES)`**, with
+the most deaths **`r top(DEATHS)`**, and with the highest mortality rate
+(among countries with over 1,000 cases, which excludes a handful of
+micro-states with implausible ratios) **`r top(MORTALITY, min_cases = 1000)`**.
+Whereas the first two rankings are dominated by populous countries, the third one
+comprises mostly low-income or conflict-affected countries, i.e., strongly
+indicating a non-uniform distribution of the examined COVID data.
+
+```{r figure2, echo = TRUE, fig.height = 3.6, fig.pos = "H"}
+ggplot(LATEST                                                                %>%
+       transmute(ISO3, Cases = CASES, Deaths = DEATHS,
+                 `Mortality rate (%)` = if_else(CASES >= 1000,
+                                                100 * MORTALITY, NA))        %>%
+       pivot_longer(-ISO3,  names_to  = "SERIES", values_to = "VALUE")       %>%
+       filter(!is.na(VALUE))                                                 %>%
+       mutate(SERIES = factor(SERIES, levels = c("Cases", "Deaths",
+                                                 "Mortality rate (%)")))     %>%
+       group_by(SERIES)                                                      %>%
+                slice_max(order_by = VALUE, n = 10, with_ties = FALSE)       %>%
+       ungroup(),
+       aes(x = reorder(paste(ISO3, SERIES, sep = "|"), VALUE), y = VALUE))     +
+  geom_col(width = 0.7)                                                        +
+  coord_flip()                                                                 +
+  facet_wrap(~ SERIES, scales = "free", axes        = "all_x",
+                                        axis.labels = "all_x")                 +
+  scale_x_discrete(labels = \(x) str_remove(x, "\\|.*$"))                      +
+  scale_y_continuous(labels = scales::label_number(
+                              scale_cut = scales::cut_short_scale()))          +
+  labs(
+    title = paste0("Figure 2. Top ten countries (ISO 3166-1 codes), ",
+                   format(max(COVID$MONTH), "%b %Y")),
+    x = "Country (ISO3)",
+    y = "Cumulative value"
+  )                                                                            +
+  theme_minimal()
+```
+
+The formal statistical test of **H2** is based on Pearson's chi-square
+goodness-of-fit test `chisq.test()` applied to three distributions across
+countries as of `r m_max`, i.e., for the world as a whole (regional
+aggregates being absent from the data). For cases and deaths, the null
+hypothesis assumes a uniform distribution across the $k$ countries
+($H_0: p_1 = p_2 = \cdots = p_k = 1/k$); for the mortality rate, it assumes
+deaths distributed proportionally to cases
+($H_0: p_i = \text{CASES}_i / \sum_{j=1}^{k} \text{CASES}_j$), i.e., an
+identical mortality rate in every country, with a p-value precision of
+$0.001$. Table 2 comprises the $\chi^2$ statistics, degrees of freedom, and
+upper-tail p-values. $H_0$ is rejected in all cases at the 5% significance
+level ($\alpha=0.05$), confirming a statistically significant non-uniform
+distribution across countries, which may reflect variations in population
+size, age structure, testing capacity, healthcare quality, reporting
+standards, etc. -- i.e., potential relationships that require further
+investigation.
+
+```{r table2, echo = TRUE}
+LATEST                                                                       %>%
+summarize(
+         Cases            = list(chisq.test(CASES)),
+         Deaths           = list(chisq.test(DEATHS)),
+        `Mortality rate`  = list(chisq.test(DEATHS, p = CASES / sum(CASES)))
+)                                                                            %>%
+pivot_longer(everything(), names_to = "SERIES", values_to = "TEST")          %>%
+transmute(
+         Series  = SERIES,
+         Chi2    = sapply(TEST, \(m) unname(m$statistic)),
+         DF      = sapply(TEST, \(m) unname(m$parameter)),
+         P       = sapply(TEST, \(m) m$p.value)
+)                                                                            %>%
+mutate(P = scales::pvalue(P, accuracy = 0.001))                              %>%
+knitr::kable(digits  = 3, format.args = list(big.mark = ",",
+                                             scientific = FALSE),
+             caption = "Pearson chi-square tests of uniform distribution")
+```
+
+## Time-Series Model and Forecast
+
+In order to describe the dynamics of the three monthly world series and to
+forecast their values for the 12 months following `r m_max` -- which may provide
+valuable insights for public health authorities in anticipating the burden of
+the disease -- the following seasonal autoregressive integrated moving average
+model, $ARIMA(p,d,q)(P,D,Q)_{12}$, is employed (formalized in its standard
+backshift-operator-based form):
+
+$$
+\Phi_P(B^{12})\,\phi_p(B)\,(1-B)^d\,(1-B^{12})^D\,y_t
+= c + \Theta_Q(B^{12})\,\theta_q(B)\,\varepsilon_t,
+\qquad \varepsilon_t \sim WN(0, \sigma^2),
+$$
+
+where $B$ is the backshift operator, $\phi_p$, $\theta_q$, $\Phi_P$, and
+$\Theta_Q$ are the (seasonal) autoregressive and moving average polynomials,
+and $d$ and $D$ are the orders of (seasonal) differencing. The orders are
+selected automatically by the Hyndman-Khandakar algorithm implemented in
+`forecast::auto.arima()` [3], [4], which determines $d$ and $D$ with
+unit-root tests and then performs a stepwise search over $p$, $q$, $P$, and
+$Q$ to minimize the corrected Akaike information criterion (AIC). The model
+is estimated on the tibble `WORLD` for cases, deaths, and the mortality rate
+(in percent) separately (see Table 3, Figure 3, and the R code below for
+additional details).
+
+```{r modelA, echo = TRUE, results = 'hide'}
+models    <- WORLD                                                           %>%
+             transmute(Cases = CASES, Deaths = DEATHS,
+                      `Mortality rate (%)` = 100 * MORTALITY)                %>%
+             map(\(y) auto.arima(ts(y, frequency = 12,
+                                    start = c(year( min(WORLD$MONTH)),
+                                              month(min(WORLD$MONTH))))))
+forecasts <- map(models, forecast, h = 12)
+```
+
+```{r hidden4, include = FALSE}
+ljung_box <- function(m) {                              # as in checkresiduals()
+  res <- residuals(m)
+  lag <- max(length(coef(m)) + 3, min(2 * frequency(res),
+                                      round( length(res) / 5)))
+  Box.test(res, lag = lag, type = "Ljung-Box", fitdf = length(coef(m)))
+}
+DIAG      <- tibble(
+  Series  = names(models),
+  Model   = sapply(models, as.character),
+  AIC     = sapply(models, \(m) m$aicc),
+  Q       = sapply(models, \(m) unname(ljung_box(m)$statistic)),
+  DF      = sapply(models, \(m) unname(ljung_box(m)$parameter)),
+  P       = sapply(models, \(m) ljung_box(m)$p.value)
+)
+FORECAST  <- imap(forecasts, \(f, s) tibble(
+  SERIES  = s,
+  MONTH   = max(WORLD$MONTH) %m+% months(1:12),
+  VALUE   = as.numeric(f$mean),
+  LOW80   = as.numeric(f$lower[, 1]), HIGH80 = as.numeric(f$upper[, 1]),
+  LOW95   = as.numeric(f$lower[, 2]), HIGH95 = as.numeric(f$upper[, 2])
+))                                                                           %>%
+  bind_rows()                                                                %>%
+  mutate(SERIES = factor(SERIES, levels = names(models)))
+horizon   <- FORECAST                                                        %>%
+  filter(MONTH == max(MONTH))                                                %>%
+  select(SERIES, VALUE)                                                      %>%
+  deframe()
+seasonal  <- any(str_detect(DIAG$Model, "\\[12\\]"))
+white     <- all(DIAG$P >= 0.05)
+```
+
+Following the model, the formal statistical test of **H3** is the Ljung-Box
+test of the residuals, $H_0: \rho_1 = \cdots = \rho_h = 0$ (white noise)
+against $H_1: \exists_{\rho_j}\ \rho_j \neq 0$, with $h$ and the degrees of
+freedom chosen as in `forecast::checkresiduals()`. Table 3 comprises the
+selected specification of each model, its AIC, and the Ljung-Box statistic
+$Q$, degrees of freedom, and p-value. `auto.arima()` selected
+`r DIAG$Model[1]` for cases, `r DIAG$Model[2]` for deaths, and
+`r DIAG$Model[3]` for the mortality rate, i.e., all three series required
+differencing, as anticipated in the analysis of time trends,
+`r if (seasonal) "with seasonal components in at least one case" else
+"while no seasonal components were selected"`. $H_0$ is
+`r if (white) "not rejected" else "rejected for at least one series"` at the
+5% significance level ($\alpha=0.05$), i.e.,
+`r if (white) paste("the residuals of all three models are statistically",
+"indistinguishable from white noise, supporting **H3**, ",
+"i.e. making the Auto-ARIMA to be a good model choice") else
+paste("residual autocorrelation remains in at least one model, which",
+"weakens the support for **H3**")`.
+
+```{r table3, echo = TRUE}
+DIAG                                                                         %>%
+mutate(P = scales::pvalue(P, accuracy = 0.001))                              %>%
+knitr::kable(digits  = 3, format.args = list(big.mark = ",",
+                                             scientific = FALSE),
+             caption = "Selected ARIMA models and Ljung-Box tests")
+```
+
+Figure 3 depicts the 12-month forecasts (point forecasts with 80% and 95%
+prediction intervals), which extrapolate the cumulative time series: by
+`r format(max(FORECAST$MONTH), "%B %Y")`, the point forecasts amount to ca.
+**`r number_fmt(round(horizon["Cases"]))` cases** and
+**`r number_fmt(round(horizon["Deaths"]))` deaths**, with the **mortality
+rate at `r round(horizon["Mortality rate (%)"], 2)`%** (versus
+`r percent_fmt(mortality)` in `r m_max`), while the implied ratio of the
+forecasted deaths to the forecasted cases declines to ca.
+`r round(100 * horizon["Deaths"] / horizon["Cases"], 2)`%, since the
+forecasted cases grow faster -- i.e., the three univariate models are not
+mutually consistent. Given only `r nrow(WORLD)` monthly observations, the
+prediction intervals widen rapidly with the horizon (for the mortality rate,
+the lower bounds even become negative, since the Gaussian intervals ignore
+the non-negativity of the ratio), and the forecasts should be interpreted as
+a continuation of the most recent dynamics rather than a serious epidemiological
+projection.
+
+```{r figure3, echo = TRUE, fig.height = 3.2, fig.pos = "H"}
+ggplot(WORLD                                                                 %>%
+       transmute(MONTH, Cases = CASES, Deaths = DEATHS,
+                `Mortality rate (%)` = 100 * MORTALITY)                      %>%
+       pivot_longer(-MONTH, names_to = "SERIES", values_to = "VALUE")        %>%
+       mutate(SERIES = factor(SERIES, levels = names(models))),
+       aes(x = MONTH, y = VALUE))                                              +
+  geom_ribbon(data = FORECAST, aes(ymin = LOW95, ymax = HIGH95),
+              fill = "red", alpha = 0.15)                                      +
+  geom_ribbon(data = FORECAST, aes(ymin = LOW80, ymax = HIGH80),
+              fill = "red", alpha = 0.30)                                      +
+  geom_line(data = FORECAST,  linewidth = 0.7,  color = "red")                 +
+  geom_line(linewidth = 0.7)                                                   +
+  facet_wrap(~SERIES, scales = "free_y", axes = "all_x",
+                                         axis.labels = "all_x")                +
+  scale_y_continuous(labels  = scales::comma)                                  +
+  labs(
+    title = paste0("Figure 3. ARIMA forecasts, ",
+                   format(min(FORECAST$MONTH), "%b %Y"), "-",
+                   format(max(FORECAST$MONTH), "%b %Y")),
+    x = "Month",
+    y = "Cumulative value (world)"
+  )                                                                            +
+  theme_minimal()
+```
+
+## Discussion of Potential Bias
+
+The findings in the report, despite the use of rigorous methodology, are subject
+to several potential biases, the first group of which is data-related. On the
+one hand, both the numerator and the denominator of the mortality rate are
+measured with error: COVID-19 deaths may have included deaths "with" rather than
+"from" the disease (e.g., patients with severe comorbidities or other diseases,
+since countries differed in whether a positive test alone sufficed for the
+classification), while confirmed casescomprised false positives (imperfect
+specificity of PCR and rapid antigen tests) and, far more importantly, omitted a
+substantial share of undetected cases (asymptomatic or mild infections, limited
+testing capacity, and individual home testing from 2022 onward). On the other
+hand, monthly aggregation discarded the within-month variability in data.
+
+The second group of potential biases is method-related, given that the three
+hypotheses were tested with basic (textbook) procedures. First, the linear
+trends in Table 1 were estimated on cumulative (integrated) series, which
+violate the Gauss-Markov assumptions and inflate both the $R^2$ and the
+significance of the slopes -- i.e., the trends are descriptive rather than
+inferential. Second, Pearson's $\chi^2$ tests in Table 2 are based on counts
+in the hundreds of millions, so that even thr smallest deviations are
+statistically significant, i.e., the rejection of **H2** is practically
+guaranteed (moreover, the expected counts of a few micro-states fall below
+five). Third, the ARIMA models were estimated on only `r nrow(WORLD)` monthly
+observations with structural breaks (new disease variants, vaccination, and/or
+changes in mitigation policies), and the mortality rate was modeled directly as
+a ratio rather than derived from its components. Hence, although these
+limitations do not necessarily invalidate the obtained findings, they merit
+further investigation (beyond the scope of this short report).
+
+## Conclusion
+
+This brief report examined `r number_fmt(total_cases)` confirmed COVID-19
+cases and `r number_fmt(total_deaths)` deaths recorded by the Johns Hopkins
+University CSSE in `r n_iso3` countries between `r m_min` and `r m_max` (a
+world mortality rate of `r percent_fmt(mortality)`) and answered the three
+research questions with formal statistical hypotheses tested at the 5%
+significance level ($\alpha=0.05$). First, in terms of long-term trends (1),
+the monthly series exhibited significant linear trends -- increasing for
+cumulative cases and deaths and declining for the mortality rate, which
+peaked at `r percent_fmt(peak$MORTALITY)` in
+`r format(peak$MONTH, "%B %Y")` -- leading to acceptance of **H1** (see
+Table 1), with the declining trend shared by `r n_neg` of the `r n_slopes`
+countries. Second, in terms of the cross-country structure (2), cases and
+deaths were concentrated in a few populous countries, while the highest
+mortality rates were observed in countries with limited testing capacity
+(see Figure 2), and Pearson's $\chi^2$ tests rejected both the uniform
+distribution of cases and deaths and the proportionality of deaths to cases
+(see Table 2), i.e., rejecting **H2**. Third, in terms of the time-series
+model (3), `auto.arima()` selected `r DIAG$Model[1]`, `r DIAG$Model[2]`, and
+`r DIAG$Model[3]` for cases, deaths, and the mortality rate, respectively,
+with the Ljung-Box tests
+`r if (white) "supporting" else "only partially supporting"` **H3** (see
+Table 3), and the 12-month forecasts extrapolated the cumulative series,
+with the mortality rate expected at ca.
+`r round(horizon["Mortality rate (%)"], 2)`% by
+`r format(max(FORECAST$MONTH), "%B %Y")` (see Figure 3). To sum up, in light
+of the potential biases -- above all, the measurement error in both deaths
+(which may have included other diseases) and cases (false positives and,
+predominantly, undetected infections) -- the findings should be interpreted
+with caution and subject to further investigation.
+
+## References
+
+[1] Dong, Ensheng, Hongru Du, and Lauren Gardner. 2020. "An Interactive
+Web-Based Dashboard to Track COVID-19 in Real Time." *The Lancet Infectious
+Diseases* 20 (5): 533–34. https://doi.org/10.1016/S1473-3099(20)30120-1.
+
+[2] Johns Hopkins University Center for Systems Science and Engineering
+(JHU CSSE). 2023. "COVID-19 Data Repository by the Center for Systems Science
+and Engineering (CSSE) at Johns Hopkins University." Dataset. GitHub.
+https://github.com/CSSEGISandData/COVID-19.
+
+[3] Hyndman, Rob J., and Yeasmin Khandakar. 2008. "Automatic Time Series
+Forecasting: The forecast Package for R." *Journal of Statistical Software*
+27 (3): 1–22. https://doi.org/10.18637/jss.v027.i03.
+
+[4] Hyndman, Rob J., George Athanasopoulos, Christoph Bergmeir, Gabriel
+Caceres, Leanne Chhay, Mitchell O'Hara-Wild, Fotios Petropoulos, Slava
+Razbash, Earo Wang, and Farah Yasmeen. 2026. *forecast: Forecasting Functions
+for Time Series and Linear Models*. R package version 9.0.2.
+https://doi.org/10.32614/CRAN.package.forecast.
+
+Bolotov, Ilya. 2026. *rconvertu: From/to Classification Converter*. R package
+version 1.1.0. https://doi.org/10.32614/CRAN.package.rconvertu.
+
+Hyndman, Rob J., and George Athanasopoulos. 2021. *Forecasting: Principles
+and Practice*. 3rd ed. Melbourne: OTexts. https://otexts.com/fpp3/.
+
+R Core Team. 2025a. *R: A Language and Environment for Statistical
+Computing*. Version 4.5.1. Vienna: R Foundation for Statistical Computing.
+https://www.R-project.org/.
+
+R Core Team. 2025b. "chisq.test: Pearson's Chi-Squared Test for Count Data."
+In *R Documentation*, package `stats`, version 4.5.1.
+https://stat.ethz.ch/R-manual/R-patched/library/stats/html/chisq.test.html.
+
+R Core Team. 2025c. "Box.test: Box-Pierce and Ljung-Box Tests." In
+*R Documentation*, package `stats`, version 4.5.1.
+https://stat.ethz.ch/R-manual/R-patched/library/stats/html/box.test.html.
+
+Wickham, Hadley, Mine Çetinkaya-Rundel, and Garrett Grolemund. 2023. *R for
+Data Science: Import, Tidy, Transform, Visualize, and Model Data*. 2nd ed.
+Sebastopol, CA: O'Reilly Media. https://r4ds.hadley.nz.
+
+## Acknowledgement of AI Use
+
+I acknowledge the use of Grammarly (https://www.grammarly.com) to check the
+spelling, grammar, and punctuation of the final text of this report.
